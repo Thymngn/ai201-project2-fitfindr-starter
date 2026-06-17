@@ -73,7 +73,54 @@ tell the user the card couldn't be saved and ask them to confirm the outfit
 
 ### Additional Tools (if any)
 
-<!-- Copy the block above for any tools beyond the required three -->
+---
+
+### Tool 4: compare_price
+
+**What it does:**
+Given a listing, finds comparable items in the dataset (same category, at least one shared style tag) and estimates whether the price is fair, a good deal, or overpriced.
+
+**Input parameters:**
+- `item` (dict): a listing dict returned by `search_listings`
+
+**What it returns:**
+A dict with: `verdict` (str — "good deal", "fair", or "overpriced"), `avg_comparable_price` (float), `comparable_count` (int), `message` (str — human-readable summary).
+
+**What happens if it fails or returns nothing:**
+If fewer than 1 comparable listing is found, returns verdict "unknown" with a message explaining there isn't enough data to compare.
+
+---
+
+### Tool 5: get_trending_styles
+
+**What it does:**
+Surfaces currently trending thrift/secondhand styles using the LLM as a trend oracle. In a production version, this would call a real fashion platform API (e.g., Depop trending tags).
+
+**Input parameters:**
+- `size` (str, optional): filter trends relevant to a specific size
+- `category` (str, optional): filter trends to a specific category (tops, bottoms, etc.)
+
+**What it returns:**
+A list of up to 5 trend dicts, each with: `name` (str), `description` (str), `style_tags` (list), `example_items` (list of 2 example pieces).
+
+**What happens if it fails or returns nothing:**
+If the LLM returns invalid JSON, returns an empty list and logs the error. The agent tells the user trend data is unavailable and falls back to the standard search flow.
+
+---
+
+### Style Profile Memory
+
+**What it does:**
+Persists a user's style preferences (size, favorite style tags, price range) to `data/style_profile.json` so they carry over across sessions. Implemented as two helper functions: `load_style_profile()` and `save_style_profile(profile)`.
+
+**load_style_profile input:** none — reads from disk.
+**save_style_profile input:** `profile` (dict) with keys: `style_tags` (list), `size` (str or None), `max_price` (float or None).
+
+**What it returns:**
+`load_style_profile` returns the saved profile dict, or a default empty profile if no file exists yet. `save_style_profile` returns a confirmation string.
+
+**What happens if it fails:**
+If the profile file is corrupted or unreadable, `load_style_profile` returns the default empty profile rather than crashing.
 
 ---
 
@@ -81,7 +128,15 @@ tell the user the card couldn't be saved and ask them to confirm the outfit
 
 **How does your agent decide which tool to call next?**
 <!-- Describe the logic your planning loop uses. What does it look at? What conditions change its behavior? How does it know when it's done? -->
-It will follow in order, first search_listing. Before using suggest_outfit, there must be a return value from search_listing. Next up, is create_fit_card where the user save their newly found outfit idea to the card.
+At startup, `load_style_profile` runs automatically to restore any saved preferences. If the user asks about trends, `get_trending_styles` runs before search. Otherwise the loop follows this order:
+
+1. `search_listings` — required first step; must return results before proceeding.
+2. `compare_price` — runs automatically on the top result to give the user a price verdict.
+3. `suggest_outfit` — requires a `selected_item` from step 1.
+4. `create_fit_card` — requires a non-empty `outfit_suggestion` from step 3.
+5. `save_style_profile` — runs at the end of every successful session to persist preferences.
+
+The loop ends after `create_fit_card` succeeds, or early if any required step fails.
 
 ---
 
@@ -91,18 +146,24 @@ It will follow in order, first search_listing. Before using suggest_outfit, ther
 <!-- Describe how your agent stores and accesses state within a session. What data is tracked? How is it passed between tool calls? -->
 
 state = {
-    "wardrobe": load_wardrobe(),   # loaded once from file at startup, never mutated
-    "search_results": [],           # appended to on each new search, never overwritten
-    "selected_item": None,          # set when user picks an item from search_results
-    "suggested_outfits": [],        # set by suggest_outfit, replaced each call
-    "fit_cards": []                 # grows as user saves looks via create_fit_card
+    "style_profile":    load_style_profile(),  # loaded from disk at startup; persisted at end of session
+    "wardrobe":         load_wardrobe(),        # loaded once from file at startup, never mutated
+    "search_results":   [],                     # appended to on each new search, capped at 10
+    "selected_item":    None,                   # set when user picks an item from search_results
+    "price_comparison": None,                   # set by compare_price on selected_item
+    "suggested_outfits": [],                    # set by suggest_outfit, replaced each call
+    "fit_cards":        [],                     # grows as user saves looks via create_fit_card
+    "trending_styles":  [],                     # set when user requests get_trending_styles
 }
 
-- wardrobe is read-only after startup — suggest_outfit reads it but never modifies it.
-- search_results accumulates across searches so the user can reference earlier finds.
-- selected_item is updated whenever the user picks a listing to style.
-- suggest_outfit overwrites suggested_outfits on each new call since it's always based on the current selected_item.
-- create_fit_card appends to fit_cards — saves persist for the whole session.
+- `style_profile` is loaded from `data/style_profile.json` at startup and saved back at the end of every successful session via `save_style_profile`.
+- `wardrobe` is read-only — `suggest_outfit` reads it but never modifies it.
+- `search_results` accumulates across searches (capped at 10); each entry stores the original query params and results.
+- `selected_item` is updated when the user picks a listing from search_results.
+- `price_comparison` is overwritten each time `compare_price` is called on a new selected_item.
+- `suggest_outfit` overwrites `suggested_outfits` on each call since it's always tied to the current selected_item.
+- `fit_cards` only grows — cards are never removed unless the user explicitly deletes one.
+- `trending_styles` is overwritten each time `get_trending_styles` is called.
 ---
 
 ## Error Handling
@@ -130,6 +191,16 @@ For each tool, describe the specific failure mode you're handling and what the a
 │ create_fit_card │  missing or     │ Identify which field is missing (selected_item or │
 │                 │ incomplete      │  suggested_outfits) and ask them to confirm the   │
 │                 │                 │ outfit before retrying.                           │
+├─────────────────┼─────────────────┼───────────────────────────────────────────────────┤
+│                 │ No comparable   │ Return verdict "unknown", tell the user there     │
+│ compare_price   │ listings found  │ isn't enough data to evaluate the price, and      │
+│                 │                 │ continue the flow normally.                       │
+├─────────────────┼─────────────────┼───────────────────────────────────────────────────┤
+│get_trending_    │ LLM returns     │ Return an empty list, tell the user trend data    │
+│styles           │ invalid JSON    │ is unavailable, fall back to standard search.     │
+├─────────────────┼─────────────────┼───────────────────────────────────────────────────┤
+│load_style_      │ File missing or │ Return the default empty profile and continue     │
+│profile          │ corrupted       │ normally — never crash on a missing profile.      │
 └─────────────────┴─────────────────┴───────────────────────────────────────────────────┘
 
 ---
@@ -137,9 +208,20 @@ For each tool, describe the specific failure mode you're handling and what the a
 ## Architecture
 
 ```
+  ┌──────────────────────┐
+  │  load_style_profile  │  ◄── runs at startup, loads data/style_profile.json
+  └──────────┬───────────┘
+             │
+             ▼
   ┌─────────────────┐
   │   User Input    │
   └────────┬────────┘
+           │
+           ├─── trend request ──► ┌───────────────────────┐
+           │                      │  get_trending_styles   │
+           │                      └──────────┬────────────┘
+           │                      no JSON ──► tell user: unavailable
+           │                      success ──► show trends, user refines search
            │
            ▼
   ┌─────────────────┐
@@ -164,7 +246,19 @@ For each tool, describe the specific failure mode you're handling and what the a
   │    (state)      │
   └────────┬────────┘
            │
-           │ 2. style request
+           │ 2. price check (auto)
+           ▼
+  ┌─────────────────┐   no comparables   ┌──────────────────────┐
+  │  compare_price  │───────────────────►│ tell user: unknown   │
+  └────────┬────────┘                    │ price, continue      │
+           │ verdict                     └──────────────────────┘
+           ▼
+  ┌─────────────────┐
+  │price_comparison │
+  │    (state)      │
+  └────────┬────────┘
+           │
+           │ 3. style request
            ▼
   ┌─────────────────┐◄──────────────────────────────────────┐
   │  suggest_outfit │          ┌───────────────────────────┐ │
@@ -178,7 +272,7 @@ For each tool, describe the specific failure mode you're handling and what the a
   │    (state)      │
   └────────┬────────┘
            │
-           │ 3. save request
+           │ 4. save request
            ▼
   ┌─────────────────┐  missing data  ┌───────────────────────┐
   │ create_fit_card │───────────────►│ tell user: confirm    │
@@ -194,7 +288,12 @@ For each tool, describe the specific failure mode you're handling and what the a
   ┌─────────────────┐
   │ show fit card   │
   │   to user       │
-  └─────────────────┘
+  └────────┬────────┘
+           │
+           ▼
+  ┌──────────────────────┐
+  │  save_style_profile  │  ◄── runs at end of every successful session
+  └──────────────────────┘
 ```
 
 ---
@@ -231,9 +330,11 @@ Write out what a full user interaction looks like from start to finish — tool 
 
 **Example user query:** "I'm looking for a vintage graphic tee under $30. I mostly wear baggy jeans and chunky sneakers. What's out there and how would I style it?"
 
+**Step 0 (startup):**
+Agent calls `load_style_profile` — no saved profile exists yet, so the default empty profile is loaded. Agent calls `get_trending_styles` — LLM returns 5 trending styles including "streetwear graphic tees", which the user notices matches their intent.
+
 **Step 1:**
-<!-- What does the agent do first? Which tool is called? With what input? -->
-Agent parses the query and calls search_listings:
+Agent parses the query and calls `search_listings`:
 - description: "vintage graphic tee"
 - size: not specified (omitted)
 - max_price: 30.0
@@ -243,10 +344,18 @@ Returns top 3 matches under $30 with matching style tags:
 2. lst_033 — Vintage Band Tee, Faded Grey ($19, grey, size L)
 3. lst_002 — Y2K Baby Tee, Butterfly Print ($18, white/pink, size S/M)
 
-**Step 2:**
-<!-- What happens next? What was returned from step 1? What tool is called now? -->
-Agent presents the 3 results. User picks lst_006. selected_item is updated. Agent calls suggest_outfit:
+Results stored in search_history.
 
+**Step 2:**
+Agent presents the 3 results. User picks lst_006. `selected_item` is updated. Agent automatically calls `compare_price`:
+- item: lst_006 ($24, category: tops, style_tags: graphic tee, vintage, grunge, streetwear)
+- Finds 4 comparable tops with overlapping style tags, avg price $20.50
+- Returns verdict: "fair" — $24.00 vs avg $20.50 across 4 comparable listings.
+
+Agent shows the price verdict alongside the listing.
+
+**Step 3:**
+Agent calls `suggest_outfit`:
 - new_item: lst_006 (black graphic tee, style_tags: graphic tee, vintage, grunge, streetwear)
 - wardrobe: loaded from wardrobe_schema.json
 
@@ -256,21 +365,27 @@ Matches style_tags with wardrobe — returns outfit combo:
 
 Result stored in suggested_outfits.
 
-**Step 3:**
-<!-- Continue until the full interaction is complete -->
-User wants to save the look. Agent calls create_fit_card:
+**Step 4:**
+User wants to save the look. Agent calls `create_fit_card`:
 - outfit: baggy jeans + chunky sneakers + optional denim jacket
 - new_item: lst_006
 
 Fit card appended to fit_cards.
 
+**Step 5 (end of session):**
+Agent calls `save_style_profile` with the preferences learned this session:
+- style_tags: ["vintage", "graphic tee", "streetwear"]
+- size: null
+- max_price: 30.0
+
+Profile saved to `data/style_profile.json` for next session.
+
 **Final output to user:**
-<!-- What does the user actually see at the end? -->
 Here's your fit card:
 "2003 Bootleg Tee Look"
-- Graphic Tee — 2003 Tour Bootleg Style ($24, Depop)
+- Graphic Tee — 2003 Tour Bootleg Style ($24, Depop) — fair price
 - Baggy straight-leg dark wash jeans
 - Chunky white sneakers
 - Layer option: Vintage black denim jacket
-▎
+
 Saved to your fit cards.
