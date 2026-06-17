@@ -15,6 +15,7 @@ but check your terminal — the port may differ).
 import gradio as gr
 
 from agent import run_agent
+from tools import compare_price, load_style_profile, save_style_profile, get_trending_styles
 from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
 
 
@@ -25,26 +26,70 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
     Called by Gradio when the user submits a query.
 
     Args:
-        user_query:     The text the user typed into the search box.
+        user_query:      The text the user typed into the search box.
         wardrobe_choice: Either "Example wardrobe" or "Empty wardrobe (new user)".
 
     Returns:
         A tuple of three strings:
             (listing_text, outfit_suggestion, fit_card)
         Each string maps to one of the three output panels in the UI.
-
-    TODO:
-        1. Guard against an empty query (return early with an error message).
-        2. Select the wardrobe based on wardrobe_choice.
-        3. Call run_agent() with the query and selected wardrobe.
-        4. If session["error"] is set, return the error in the first panel
-           and empty strings for the other two.
-        5. Otherwise, format session["selected_item"] into a readable listing_text
-           string and return it along with session["outfit_suggestion"] and
-           session["fit_card"].
     """
-    # TODO: implement this function
-    return "Agent not yet implemented.", "", ""
+    # Guard: empty query → show trending styles instead
+    if not user_query or not user_query.strip():
+        trends = get_trending_styles()
+        if trends:
+            lines = ["No query entered. Here are trending styles right now:\n"]
+            for t in trends:
+                lines.append(f"• {t['name']}: {t['description']}")
+                lines.append(f"  Tags: {', '.join(t['style_tags'])}\n")
+            return "\n".join(lines), "", ""
+        return "Please enter a search query.", "", ""
+
+    # Load saved style profile from previous sessions
+    profile = load_style_profile()
+
+    # Select wardrobe
+    wardrobe = (
+        get_example_wardrobe()
+        if wardrobe_choice == "Example wardrobe"
+        else get_empty_wardrobe()
+    )
+
+    # Run the main agent loop
+    session = run_agent(user_query, wardrobe)
+
+    # Surface error in the listing panel
+    if session["error"]:
+        return session["error"], "", ""
+
+    # Format listing panel — include price comparison verdict
+    item = session["selected_item"]
+    price_info = compare_price(item)
+
+    listing_text = (
+        f"{item['title']}\n"
+        f"Price: ${item['price']:.2f}  •  {price_info['verdict'].upper()}\n"
+        f"{price_info['message']}\n\n"
+        f"Size:      {item['size']}\n"
+        f"Condition: {item['condition']}\n"
+        f"Colors:    {', '.join(item['colors'])}\n"
+        f"Style:     {', '.join(item['style_tags'])}\n"
+        f"Platform:  {item['platform']}\n"
+    )
+    if item.get("brand"):
+        listing_text += f"Brand:     {item['brand']}\n"
+
+    # Update and persist style profile with what we learned this session
+    profile["style_tags"] = list(
+        set(profile.get("style_tags", [])) | set(item.get("style_tags", []))
+    )
+    if session["parsed"].get("size"):
+        profile["size"] = session["parsed"]["size"]
+    if session["parsed"].get("max_price"):
+        profile["max_price"] = session["parsed"]["max_price"]
+    save_style_profile(profile)
+
+    return listing_text, session["outfit_suggestion"], session["fit_card"]
 
 
 # ── interface ─────────────────────────────────────────────────────────────────
